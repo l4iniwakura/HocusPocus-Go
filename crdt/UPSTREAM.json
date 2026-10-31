@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/reearth/ygo",
+  "version": "v1.54.0",
+  "commit": "64fa0b47c025c71fe5478957c85ce3eff8254b56",
+  "importedDirectories": ["crdt", "encoding", "internal/anycodec", "testutil"],
+  "localChanges": ["Doc.RootNames, RootTypeName and RootIsEmpty", "WithGCFilter", "GC filter in the two collection entry points", "UndoManager zero capture window never groups transactions"],
+  "patch": "../tools/patch_engine.py"
+}

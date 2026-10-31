@@ -1,0 +1,1615 @@
+package crdt
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+
+	"github.com/l4iniwakura/HocusPocus-Go/encoding"
+)
+
+// Wire content type tags matching the Yjs V1 protocol.
+const (
+	wireDeleted byte = 1
+	wireJSON    byte = 2
+	wireBinary  byte = 3
+	wireString  byte = 4
+	wireEmbed   byte = 5
+	wireFormat  byte = 6
+	wireType    byte = 7
+	wireAny     byte = 8
+	wireDoc     byte = 9
+	// Tag 10 is reserved for skip structs (decode-only, handled before the switch).
+	wireMove byte = 11 // ContentMove: CRDT-safe array move marker (ygo extension)
+)
+
+// Info byte flags for struct encoding.
+const (
+	flagHasOrigin      byte = 0x80
+	flagHasRightOrigin byte = 0x40
+	flagHasParentSub   byte = 0x20
+)
+
+// ErrInvalidUpdate is returned when a binary update cannot be decoded.
+var ErrInvalidUpdate = errors.New("crdt: invalid update")
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// EncodeStateAsUpdateV1 encodes the part of doc newer than sv as a V1 binary
+// update. Pass nil to encode the entire document state.
+func EncodeStateAsUpdateV1(doc *Doc, sv StateVector) []byte {
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+	return withParked(doc, sv, encodeV1Locked(doc, sv), encodeStructStoreV1, MergeUpdatesV1)
+}
+
+// ApplyUpdateV1 decodes and integrates a V1 binary update into doc.
+// When it changes formatted text, a local transaction with a nil origin may
+// follow it, once its observers have fired, to clean up the format markers it
+// left redundant, as in Yjs, with its own update and observer callbacks.
+func ApplyUpdateV1(doc *Doc, update []byte, origin any) error {
+	var applyErr error
+	doc.Transact(func(txn *Transaction) {
+		txn.Local = false // Yjs readUpdate: transact(..., local=false)
+		applyErr = applyV1Txn(txn, update)
+	}, origin)
+	return applyErr
+}
+
+// ApplyUpdateV1Landed is ApplyUpdateV1 for a caller that must forward what
+// a failed apply left behind. ApplyUpdateV1 integrates an update item by item,
+// so one it rejects (an update that overflows the pending cap, say) can leave
+// part of itself in doc. When the apply fails, landed is a V1 update of exactly
+// what this call integrated: the structs it added to doc's store and the
+// deletions it made, not structs still parked, nor the rest of the document.
+// landed is nil when the apply succeeds or when nothing integrated.
+func ApplyUpdateV1Landed(doc *Doc, update []byte, origin any) (landed []byte, err error) {
+	doc.Transact(func(txn *Transaction) {
+		txn.Local = false // Yjs readUpdate: transact(..., local=false)
+		if err = applyV1Txn(txn, update); err != nil {
+			landed = encodeTxnV1Locked(txn)
+		}
+	}, origin)
+	return landed, err
+}
+
+// encodeTxnV1Locked encodes the structs txn has added to the store so far and
+// the deletions it has made, or returns nil when there are none. Each client's
+// new structs are found by binary search from txn.beforeState, so the cost is
+// proportional to the clients in the store plus what txn added. Called with
+// the document lock held.
+func encodeTxnV1Locked(txn *Transaction) []byte {
+	store := txn.doc.store
+	perClient := make(map[ClientID][]*Item)
+	for client, items := range store.clients {
+		from := txn.beforeState.Clock(client)
+		i := sort.Search(len(items), func(i int) bool {
+			return items[i].ID.Clock+uint64(items[i].Content.Len()) > from
+		})
+		if i < len(items) {
+			perClient[client] = items[i:]
+		}
+	}
+	ds := cloneDeleteSet(txn.deleteSet)
+	if len(perClient) == 0 && len(ds.clients) == 0 {
+		return nil
+	}
+	return encodeStructStoreV1(perClient, ds, txn.beforeState, store)
+}
+
+// EncodeStateAsUpdateV2 encodes the document state using the Yjs V2
+// column-oriented binary format.  The output is interoperable with
+// Y.applyUpdateV2 / Y.encodeStateAsUpdateV2 from the yjs npm package.
+func EncodeStateAsUpdateV2(doc *Doc, sv StateVector) []byte {
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+	return withParked(doc, sv, encodeV2Locked(doc, sv), encodeStructStoreV2, MergeUpdatesV2)
+}
+
+// withParked merges structs and deletions still parked on a missing
+// dependency into an encoded state, as Yjs encodeStateAsUpdate does with
+// pendingStructs and pendingDs; a snapshot that dropped them would lose them
+// once the filler arrives. Kept out of encodeV1Locked so OnUpdate payloads
+// stay transaction-only, as in Yjs.
+func withParked(doc *Doc, sv StateVector, state []byte,
+	encode func(map[ClientID][]*Item, DeleteSet, StateVector, *StructStore) []byte,
+	merge func(...[]byte) ([]byte, error)) []byte {
+	s := doc.store
+	if s.pending == nil && len(s.pendingDs.clients) == 0 {
+		return state
+	}
+	updates := [][]byte{state}
+	if s.pending != nil {
+		// One update per item: parked items may overlap, and merge dedups.
+		for _, it := range s.pending.items {
+			updates = append(updates, encode(map[ClientID][]*Item{it.ID.Client: {it}}, newDeleteSet(), sv, s))
+		}
+	}
+	if len(s.pendingDs.clients) > 0 {
+		updates = append(updates, encode(nil, s.pendingDs, sv, s))
+	}
+	merged, err := merge(updates...)
+	if err != nil {
+		return state
+	}
+	return merged
+}
+
+// ApplyUpdateV2 decodes and integrates a Yjs V2 binary update into doc.
+// When it changes formatted text, a local transaction with a nil origin may
+// follow it, once its observers have fired, to clean up the format markers it
+// left redundant, as in Yjs, with its own update and observer callbacks.
+func ApplyUpdateV2(doc *Doc, update []byte, origin any) error {
+	var applyErr error
+	doc.Transact(func(txn *Transaction) {
+		txn.Local = false // Yjs readUpdate: transact(..., local=false)
+		applyErr = applyV2Txn(txn, update)
+	}, origin)
+	return applyErr
+}
+
+// UpdateV1ToV2 converts a V1 update payload to real Yjs V2 format. It works at
+// the struct level, like MergeUpdatesV1, so an incremental or delete-only
+// update converts intact (integrating into a scratch doc parked such updates
+// and emitted an empty one; yjs convertUpdateFormatV1ToV2 parity).
+func UpdateV1ToV2(v1 []byte) ([]byte, error) {
+	perClient, ds, store, err := buildMergeStore([][]byte{v1}, decodeStructsV1)
+	if err != nil {
+		return nil, err
+	}
+	return encodeStructStoreV2(perClient, ds, StateVector{}, store), nil
+}
+
+// UpdateV2ToV1 converts a real Yjs V2 update to V1 format, at the struct level
+// (see UpdateV1ToV2).
+func UpdateV2ToV1(v2 []byte) ([]byte, error) {
+	perClient, ds, store, err := buildMergeStore([][]byte{v2}, decodeStructsV2)
+	if err != nil {
+		return nil, err
+	}
+	return encodeStructStoreV1(perClient, ds, StateVector{}, store), nil
+}
+
+// MergeUpdatesV1 and DiffUpdateV1 live in merge.go — they operate at the struct
+// level (preserving non-integrable structs) rather than integrate-then-reencode.
+
+// EncodeStateVectorV1 serialises the document's state vector as a compact
+// binary blob (VarUint count, then client/clock pairs).
+func EncodeStateVectorV1(doc *Doc) []byte {
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+	sv := doc.store.StateVector()
+	clients := clientsSorted(sv)
+	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		enc.WriteVarUint(uint64(len(clients)))
+		for _, c := range clients {
+			enc.WriteVarUint(uint64(c))
+			enc.WriteVarUint(sv[c])
+		}
+	})
+}
+
+// DecodeStateVectorV1 parses a blob produced by EncodeStateVectorV1.
+func DecodeStateVectorV1(data []byte) (StateVector, error) {
+	dec := encoding.NewDecoder(data)
+	n, err := dec.ReadVarUint()
+	if err != nil {
+		return nil, wrapUpdateErr(err)
+	}
+	// Each entry requires at least 2 bytes (client varuint + clock varuint).
+	// Guard against a crafted count that would cause a multi-GB map allocation.
+	if n > uint64(len(data)/2) || n > maxV2Items {
+		return nil, ErrInvalidUpdate
+	}
+	sv := make(StateVector, n)
+	for i := uint64(0); i < n; i++ {
+		c, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, wrapUpdateErr(err)
+		}
+		clock, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, wrapUpdateErr(err)
+		}
+		sv[ClientID(c)] = clock
+	}
+	return sv, nil
+}
+
+// ── V1 encoding ───────────────────────────────────────────────────────────────
+
+func encodeV1Locked(doc *Doc, sv StateVector) []byte {
+	type clientGroup struct {
+		client     ClientID
+		items      []*Item
+		startClock uint64
+	}
+
+	var groups []clientGroup
+	for client, items := range doc.store.clients {
+		svClock := sv.Clock(client)
+		var relevant []*Item
+		for _, item := range items {
+			if item.ID.Clock+uint64(item.Content.Len()) > svClock {
+				relevant = append(relevant, item)
+			}
+		}
+		if len(relevant) > 0 {
+			groups = append(groups, clientGroup{client, relevant, svClock})
+		}
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].client < groups[j].client })
+
+	deleteSet := buildDeleteSet(doc.store)
+
+	return encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		enc.WriteVarUint(uint64(len(groups)))
+		for _, g := range groups {
+			enc.WriteVarUint(uint64(len(g.items)))
+			enc.WriteVarUint(uint64(g.client))
+			enc.WriteVarUint(g.startClock)
+			for i, item := range g.items {
+				offset := 0
+				if i == 0 && g.startClock > item.ID.Clock {
+					offset = int(g.startClock - item.ID.Clock)
+				}
+				encodeItem(enc, item, offset, doc.store)
+			}
+		}
+		encodeDeleteSet(enc, deleteSet)
+	})
+}
+
+// isGCOrphan reports whether item carries no positional anchors at all — the
+// shape of a garbage-collected/deleted placeholder decoded from the wire GC
+// format, whose parent a receiver cannot infer. An item with a non-nil Origin,
+// OriginRight, or parentID is NOT an orphan even if its Parent is momentarily
+// unresolved (e.g. its anchor lives outside a merge input set): its origin must
+// be preserved on the wire so the receiver can resolve the parent once it has
+// the dependency. Stripping such an origin detaches the item (#149-class merge
+// corruption).
+func (item *Item) isGCOrphan() bool {
+	return item.Parent == nil && item.Origin == nil && item.OriginRight == nil && item.parentID == nil
+}
+
+// markGCOrphan turns an item whose parent cannot be resolved into the GC struct
+// Yjs integrates it as: deleted, length-only content, and no parent or origins.
+// It then encodes as a GC struct, and nothing can resolve a parent through it,
+// so children that arrive later are orphaned too instead of integrating into a
+// detached type.
+func (item *Item) markGCOrphan() {
+	item.Deleted = true
+	item.Content = NewContentDeleted(item.Content.Len())
+	item.Parent = nil
+	item.ParentSub = nil
+	item.parentID = nil
+	item.Origin = nil
+	item.OriginRight = nil
+}
+
+func encodeItem(enc *encoding.Encoder, item *Item, offset int, store *StructStore) {
+	// Orphaned items (no parent) came from GC wire format where the parent
+	// type name is lost. Encode them as GC structs so receivers get valid
+	// clock accounting instead of corrupt data.
+	//
+	// Require no origins too: a struct-level-decoded item (MergeUpdatesV1 /
+	// DiffUpdateV1) that infers its parent from an origin legitimately has a nil
+	// Parent but a valid Origin/OriginRight — it must be encoded as a normal item
+	// (origin + content, no parent info), NOT as a GC placeholder, or its content
+	// would be lost. Parent info is only written in the no-origin branch below,
+	// so an origin-bearing item never dereferences item.Parent. (#125)
+	//
+	// Also exclude items carrying a deferred parent-by-ID: they have a nil Parent
+	// (not yet integrated) but a known container ID in parentID, and must be
+	// encoded as a normal item so the no-origin branch below can re-emit the
+	// explicit parent-by-ID. Treating them as GC orphans here dropped their
+	// content and parent link (silent data loss on merge). (#140)
+	if item.Parent == nil && item.Origin == nil && item.OriginRight == nil && item.parentID == nil {
+		length := item.Content.Len()
+		if offset > 0 {
+			length -= offset
+		}
+		enc.WriteUint8(0) // GC struct info byte
+		enc.WriteVarUint(uint64(length))
+		return
+	}
+
+	var tag byte
+	switch item.Content.(type) {
+	case *ContentDeleted:
+		tag = wireDeleted
+	case *ContentJSON:
+		tag = wireJSON
+	case *ContentBinary:
+		tag = wireBinary
+	case *ContentString:
+		tag = wireString
+	case *ContentEmbed:
+		tag = wireEmbed
+	case *ContentFormat:
+		tag = wireFormat
+	case *ContentType:
+		tag = wireType
+	case *ContentAny:
+		tag = wireAny
+	case *ContentDoc:
+		tag = wireDoc
+	case *ContentMove:
+		tag = wireMove
+	default:
+		tag = wireAny
+	}
+
+	// Effective origins for this encoded slice.
+	var origin, originRight *ID
+	if offset > 0 {
+		oc := item.ID.Clock + uint64(offset) - 1
+		origin = &ID{Client: item.ID.Client, Clock: oc}
+		originRight = item.OriginRight
+	} else {
+		origin = item.Origin
+		originRight = item.OriginRight
+	}
+
+	// If the origin item is a GC placeholder (no Parent), the receiver can't
+	// infer this item's parent from it. Clear the origin so that explicit
+	// parent info is encoded instead, allowing the receiver to resolve the
+	// parent directly from the named root type or container item ID.
+	if origin != nil {
+		if oi := store.Find(*origin); oi != nil && oi.isGCOrphan() {
+			origin = nil
+		}
+	}
+	if originRight != nil {
+		if ori := store.Find(*originRight); ori != nil && ori.isGCOrphan() {
+			originRight = nil
+		}
+	}
+
+	info := tag
+	if origin != nil {
+		info |= flagHasOrigin
+	}
+	if originRight != nil {
+		info |= flagHasRightOrigin
+	}
+	if item.ParentSub != nil {
+		info |= flagHasParentSub
+	}
+	enc.WriteUint8(info)
+
+	if origin != nil {
+		enc.WriteVarUint(uint64(origin.Client))
+		enc.WriteVarUint(origin.Clock)
+	}
+	if originRight != nil {
+		enc.WriteVarUint(uint64(originRight.Client))
+		enc.WriteVarUint(originRight.Clock)
+	}
+
+	// Parent info + parentSub — only when neither origin is present. This
+	// mirrors Yjs's Item.write exactly: the BIT6 "hasParentSub" flag is set
+	// in the info byte whenever ParentSub is present (see above), but the
+	// parentSub STRING is written only inside the no-origin block. When an
+	// origin IS present the receiver inherits parentSub from the left/origin
+	// item at integration time, so writing it here would put bytes on the
+	// wire that a conformant (Yjs) decoder does not expect. (#YMap-wire)
+	if origin == nil && originRight == nil {
+		if item.Parent != nil && item.Parent.item != nil {
+			// Nested type: identify by container item's ID.
+			enc.WriteUint8(0)
+			enc.WriteVarUint(uint64(item.Parent.item.ID.Client))
+			enc.WriteVarUint(item.Parent.item.ID.Clock)
+		} else if item.parentID != nil {
+			// Deferred parent-by-ID: this item was decoded but not yet
+			// integrated (its container is in a later client group), so Parent
+			// is still nil while parentID holds the container's ID. Re-emit the
+			// explicit parent-by-ID so the receiver can defer and resolve it too.
+			// Without this the struct-level MergeUpdatesV1/DiffUpdateV1 encode
+			// path falls through to the root-named-type branch below and writes
+			// an empty name, detaching the child (silent data loss). (#140)
+			enc.WriteUint8(0)
+			enc.WriteVarUint(uint64(item.parentID.Client))
+			enc.WriteVarUint(item.parentID.Clock)
+		} else {
+			// Root named type.
+			enc.WriteUint8(1)
+			name := ""
+			if item.Parent != nil {
+				name = item.Parent.name
+			}
+			enc.WriteVarString(name)
+		}
+
+		if item.ParentSub != nil {
+			enc.WriteVarString(*item.ParentSub)
+		}
+	}
+
+	encodeContent(enc, item.Content, offset)
+}
+
+func encodeContent(enc *encoding.Encoder, c Content, offset int) {
+	switch ct := c.(type) {
+	case *ContentDeleted:
+		enc.WriteVarUint(uint64(ct.length - offset))
+	case *ContentJSON:
+		vals := ct.Vals[offset:]
+		enc.WriteVarUint(uint64(len(vals)))
+		for _, v := range vals {
+			// Yjs writes JSON text per value in V1 too, not lib0 Any.
+			enc.WriteVarString(fmtValToJSON(v))
+		}
+	case *ContentBinary:
+		enc.WriteVarBytes(ct.Data)
+	case *ContentString:
+		// Emit only the tail from `offset`. splitUTF16 emits a leading U+FFFD
+		// when offset bisects a surrogate pair, matching Yjs's mid-surrogate slice.
+		_, tail := splitUTF16(ct.Str, offset)
+		enc.WriteVarString(tail)
+	case *ContentEmbed:
+		// Yjs V1 encodes the embed via writeJSON = writeVarString(JSON.stringify).
+		// (V2 uses writeAny — see encodeContentV2.) Using WriteAny here put a
+		// lib0-tagged value on the wire that genuine Yjs decodes as a JSON
+		// string → failure. (#wire-conformance)
+		enc.WriteVarString(fmtValToJSON(ct.Val))
+	case *ContentFormat:
+		enc.WriteVarString(ct.Key)
+		enc.WriteVarString(fmtValToJSON(ct.Val))
+	case *ContentType:
+		tc, nodeName := typeClassOf(ct)
+		enc.WriteUint8(tc)
+		if tc == 3 { // YXmlElement
+			enc.WriteVarString(nodeName)
+		}
+	case *ContentAny:
+		vals := ct.Vals[offset:]
+		enc.WriteVarUint(uint64(len(vals)))
+		for _, v := range vals {
+			enc.WriteAny(v)
+		}
+	case *ContentDoc:
+		guid := ""
+		if ct.Doc != nil {
+			guid = ct.Doc.GUID()
+		}
+		enc.WriteVarString(guid)
+		enc.WriteAny(subdocOpts(ct.Doc))
+	case *ContentMove:
+		enc.WriteVarUint(uint64(ct.Target.Client))
+		enc.WriteVarUint(ct.Target.Clock)
+		enc.WriteVarUint(uint64(ct.TargetLen))
+	}
+}
+
+func typeClassOf(ct *ContentType) (byte, string) {
+	if ct.Type == nil || ct.Type.owner == nil {
+		return 0, ""
+	}
+	switch v := ct.Type.owner.(type) {
+	case *YArray:
+		return 0, ""
+	case *YMap:
+		return 1, ""
+	case *YText:
+		return 2, ""
+	case *YXmlElement:
+		return 3, v.NodeName
+	case *YXmlFragment:
+		return 4, ""
+	case *YXmlText:
+		return 6, ""
+	default:
+		return 0, ""
+	}
+}
+
+func buildDeleteSet(store *StructStore) DeleteSet {
+	ds := newDeleteSet()
+	for _, items := range store.clients {
+		for _, item := range items {
+			if item.Deleted {
+				ds.add(item.ID, item.Content.Len())
+			}
+		}
+	}
+	for client := range ds.clients {
+		ds.sortAndCompact(client)
+	}
+	return ds
+}
+
+func encodeDeleteSet(enc *encoding.Encoder, ds DeleteSet) {
+	clients := make([]ClientID, 0, len(ds.clients))
+	for c := range ds.clients {
+		clients = append(clients, c)
+	}
+	// Yjs writes delete set clients in descending order, and applies a delete
+	// set in its encoded order.
+	sort.Slice(clients, func(i, j int) bool { return clients[i] > clients[j] })
+	enc.WriteVarUint(uint64(len(clients)))
+	for _, c := range clients {
+		ranges := ds.clients[c]
+		enc.WriteVarUint(uint64(c))
+		enc.WriteVarUint(uint64(len(ranges)))
+		for _, r := range ranges {
+			enc.WriteVarUint(r.Clock)
+			enc.WriteVarUint(r.Len)
+		}
+	}
+}
+
+// ── V1 decoding ───────────────────────────────────────────────────────────────
+
+func applyV1Txn(txn *Transaction, update []byte) (retErr error) {
+	// Recover from panics emitted by Content.Splice on non-splittable types
+	// (ContentBinary, ContentEmbed, ContentFormat, ContentType, ContentDoc).
+	// A malicious update can encode such a type with a clock offset that forces
+	// a split; without recovery the server would crash instead of returning an error.
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("%w: panic during item integration: %v", ErrInvalidUpdate, r)
+		}
+	}()
+
+	dec := encoding.NewDecoder(update)
+
+	// Snapshot state vector before applying anything (used for skip/offset logic).
+	sv := txn.doc.store.StateVector()
+
+	numClients, err := dec.ReadVarUint()
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+	if numClients > uint64(len(update)/2) || numClients > maxV2Items {
+		return ErrInvalidUpdate
+	}
+
+	// 1. Decode all items, parking any with future-clock deps or same-client gaps.
+	//    Returns the within-update pending list (items whose parent might resolve
+	//    later in this same update).
+	withinUpdatePending, err := decodeAndPark(txn, dec, sv, numClients, update)
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+
+	// 2. Within-update retry pass: items whose parents arrived later in this update.
+	if err := resolveWithinUpdatePending(txn, withinUpdatePending); err != nil {
+		return err
+	}
+
+	ds, err := decodeDeleteSet(dec)
+	if err != nil {
+		return wrapUpdateErr(err)
+	}
+	unresolvableDs := ds.applyToPartial(txn)
+	if len(unresolvableDs.clients) > 0 {
+		txn.doc.store.pendingDs.Merge(unresolvableDs)
+	}
+
+	drainPending(txn)
+
+	return nil
+}
+
+// decodeAndPark walks the V1 update's per-client struct groups, decodes each
+// item, and either:
+//
+//	(a) skips fully-integrated items
+//	(b) defers items with same-client clock gaps within this update
+//	(c) integrates GC items directly via store.Append
+//	(d) integrates items whose parent is known via item.integrate
+//	(e) collects items whose parent is unresolved-but-might-be-in-this-update
+//	    into the returned slice for the within-update retry pass.
+//
+// Groups that a later group for the same client supersedes are decoded and
+// dropped (yjs parity). numClients is the count parsed from the header.
+func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numClients uint64, update []byte) ([]*Item, error) {
+	var pending []*Item
+	budget := newPendingBudget(txn.doc, sv, update, false)
+	var superseded groupSet
+	if numClients > 1 {
+		// Fail before integrating anything: a later malformed group must not
+		// leave earlier, superseded groups applied.
+		var err error
+		if superseded, err = supersededGroups(update, nil, encoding.Decoder{}); err != nil {
+			return nil, err
+		}
+	}
+	budget.setSuperseded(superseded)
+
+	totalStructs := uint64(0)
+	for i := uint64(0); i < numClients; i++ {
+		numStructs, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		totalStructs += numStructs
+		if totalStructs > maxV2Items {
+			return nil, ErrInvalidUpdate
+		}
+		clientU, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		client := ClientID(clientU)
+		clock, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+
+		existingEnd := sv.Clock(client)
+		drop := superseded.has(i)
+
+		for j := uint64(0); j < numStructs; j++ {
+			item, err := decodeItem(dec, txn.doc, client, clock)
+			if err != nil {
+				return nil, err
+			}
+			if drop {
+				continue
+			}
+
+			// Skip structs (tag 10) mark clocks the sender withheld, so the
+			// receiver does NOT have them: advance the read cursor only. Items
+			// after the skip then fall into the clock-gap branch and park until
+			// the range arrives (yjs parity, #251).
+			if _, isSkip := item.Content.(*contentSkip); isSkip {
+				clock += uint64(item.Content.Len())
+				continue
+			}
+
+			contentLen := uint64(item.Content.Len())
+			itemEnd := clock + contentLen
+
+			if itemEnd <= existingEnd {
+				// Already fully integrated — skip.
+				clock = itemEnd
+				continue
+			}
+
+			offset := 0
+			if clock < existingEnd {
+				// Partially integrated — integrate only the new suffix.
+				offset = int(existingEnd - clock)
+			}
+
+			// A predecessor may be deferred until a later client group in this
+			// same message. Resolve the bounded update before charging items to
+			// the cross-update pending limit.
+			if clock > existingEnd {
+				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return nil, err
+				}
+				clock = itemEnd
+				continue
+			}
+
+			// GC items (tag 0) have no parent — add directly to the store
+			// without linked-list integration.
+			if item.Parent == nil && item.Deleted {
+				if offset > 0 {
+					item.ID.Clock += uint64(offset)
+					item.Content = item.Content.Splice(offset)
+				}
+				txn.doc.store.Append(item)
+				existingEnd = itemEnd // track progress so subsequent items in the group are not falsely gapped
+				clock = itemEnd
+				continue
+			}
+
+			// Items whose parent can't be resolved yet (cross-client
+			// reference to a group not yet decoded) are deferred.
+			if item.Parent == nil {
+				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return nil, err
+				}
+				clock = itemEnd
+				continue
+			}
+
+			// OriginRight referencing a not-yet-integrated clock: defer (Yjs
+			// getMissing parity). A root type's parent is resolved by name, so
+			// such an item is NOT caught by the parent==nil defer above; without
+			// this, an item whose right origin is a missing concurrent client
+			// would integrate at the wrong position — permanent divergence
+			// (review finding C-2). Deferral routes it through the within-update
+			// retry and, failing that, store.pending via itemFutureDep. Only at
+			// offset==0: a split (offset>0) overlaps an already-present item, so
+			// its origins are necessarily satisfied.
+			if offset == 0 && item.OriginRight != nil &&
+				item.OriginRight.Clock >= txn.doc.store.NextClock(item.OriginRight.Client) {
+				pending = append(pending, item)
+				if err := budget.check(len(pending)); err != nil {
+					return nil, err
+				}
+				clock = itemEnd
+				continue
+			}
+
+			// Resolve left neighbor from the Origin ID so that integrate()
+			// starts its scan from the correct position in the linked list.
+			// (Local inserts set item.Left directly; remote items only have Origin.)
+			if offset == 0 && item.Origin != nil {
+				item.Left = txn.doc.store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
+			}
+
+			item.integrate(txn, offset)
+			existingEnd = itemEnd // track progress so subsequent items in the group are not falsely gapped
+			clock = itemEnd
+		}
+	}
+
+	return pending, nil
+}
+
+// resolveWithinUpdatePending retries items deferred during decoding until
+// no more dependencies resolve. tryIntegrate also stores genuine GC orphans
+// without attaching them to a root, and respects same-client clock gaps.
+// Survivors are parked in store.pending within the cross-update limit.
+// Preflight bounds unresolved items before decoding an oversized blocked tail;
+// integration retries deferred items until no further progress is possible.
+// Returns ErrInvalidUpdate (wrapped) if the pending queue cap is exceeded.
+func resolveWithinUpdatePending(txn *Transaction, pending []*Item) error {
+	if len(pending) >= pendingScheduleThreshold {
+		before := len(pending)
+		pending = retryWithinUpdatePending(txn, pending)
+		if len(pending) == before {
+			return parkWithinUpdatePending(txn, pending)
+		}
+	}
+	if len(pending) >= pendingScheduleThreshold {
+		pending = resolvePendingDependencies(txn, pending)
+	}
+	if len(pending) >= pendingScheduleThreshold {
+		pending = resolvePendingWaiters(txn, pending)
+	}
+	for len(pending) > 0 {
+		remaining := retryWithinUpdatePending(txn, pending)
+		if len(remaining) == len(pending) {
+			return parkWithinUpdatePending(txn, remaining)
+		}
+		pending = remaining
+	}
+	return nil
+}
+
+// drainPending runs the doc-level pending drain. It first retries any
+// previously-parked delete-set entries (pendingDs), then loops over
+// store.pending as long as progress is being made, integrating items and
+// re-parking those still blocked. A panic-safety closure re-parks any
+// unprocessed items back into store.pending before re-raising, so the
+// outer applyV1Txn recover (v1.1.1) can convert the panic to an error.
+// Also retries pendingDs after each successful integration pass.
+func drainPending(txn *Transaction) {
+	// pendingDs may be drainable even if pending items aren't — integrated
+	// items from this update might be targets of previously-parked deletes.
+	if len(txn.doc.store.pendingDs.clients) > 0 {
+		retryPendingDs(txn)
+	}
+
+	// Drain pending items whose dependencies have been satisfied by
+	// this update. Inline rather than recursive (Go's sync.Mutex is not
+	// reentrant; ApplyUpdateV1 is already under d.mu via doc.Transact).
+	//
+	// Loop until no progress to handle chained dependencies:
+	//   A arriving satisfies B; B (now integrated) satisfies C; etc.
+	//
+	// Matches yrs' apply_update retry gate and Yjs JS's readUpdateV2
+	// recursion, but executed inline so everything integrated during
+	// this call surfaces in a single OnUpdate notification.
+	for txn.doc.store.pending != nil && txn.doc.store.retryable(txn.doc.store.pending.missing) {
+		items := txn.doc.store.pending.items
+		txn.doc.store.pending = nil
+
+		// Process items with panic-safety: if tryIntegrate panics, re-park
+		// every item not yet integrated so a subsequent ApplyUpdate can retry
+		// them. The outer applyV1Txn recover (v1.1.1) then converts the panic
+		// to an error for the caller.
+		done := make([]bool, len(items))
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if restore, missing := unresolvedPending(txn.doc.store, items, done); len(restore) > 0 {
+						txn.doc.store.pending = &pendingUpdate{items: restore, missing: missing}
+					}
+					panic(r) // re-raise for outer recover
+				}
+			}()
+			integratePending(txn, items, done)
+		}()
+		stillPending, stillMissing := unresolvedPending(txn.doc.store, items, done)
+		progressed := len(stillPending) < len(items)
+
+		if len(stillPending) > 0 {
+			txn.doc.store.pending = &pendingUpdate{items: stillPending, missing: stillMissing}
+		}
+		// Retry pendingDs — freshly-integrated items may now be targets
+		// of previously-parked delete entries.
+		if progressed && len(txn.doc.store.pendingDs.clients) > 0 {
+			retryPendingDs(txn)
+		}
+		if !progressed {
+			// No progress this pass — infinite-loop guard. Items remain parked.
+			break
+		}
+	}
+}
+
+// unresolvedPending returns the items not marked done, in queue order, with
+// the clocks that must advance before retrying them.
+func unresolvedPending(store *StructStore, items []*Item, done []bool) ([]*Item, StateVector) {
+	var remaining []*Item
+	missing := make(StateVector)
+	for i, item := range items {
+		if done[i] {
+			continue
+		}
+		remaining = append(remaining, item)
+		if client, parkedAt, isFuture := itemFutureDep(item, store); isFuture {
+			mergePendingMissing(missing, client, parkedAt)
+		} else if item.ID.Clock > store.NextClock(item.ID.Client) {
+			// Same-client gap still blocks it.
+			mergePendingMissing(missing, item.ID.Client, store.NextClock(item.ID.Client))
+		}
+	}
+	return remaining, missing
+}
+
+func decodeItem(dec *encoding.Decoder, doc *Doc, client ClientID, clock uint64) (*Item, error) {
+	info, err := dec.ReadUint8()
+	if err != nil {
+		return nil, err
+	}
+	tag := info & 0x1F
+
+	// GC struct (tag 0): placeholder for garbage-collected content.
+	// Yjs encodes these as {info=0, VarUint(length)} — no origins, parent,
+	// or content fields. They fill clock gaps in the store.
+	if tag == 0 {
+		length, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		return &Item{
+			ID:      ID{Client: client, Clock: clock},
+			Content: NewContentDeleted(int(length)),
+			Deleted: true,
+		}, nil
+	}
+
+	// Skip struct (tag 10): clock-range placeholder the sender intentionally
+	// omits. Wire format: {info, VarUint(length)}. Not stored in the document.
+	if tag == 10 {
+		length, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		return &Item{
+			ID:      ID{Client: client, Clock: clock},
+			Content: &contentSkip{length: int(length)},
+		}, nil
+	}
+
+	hasOrigin := info&flagHasOrigin != 0
+	hasRightOrigin := info&flagHasRightOrigin != 0
+	hasParentSub := info&flagHasParentSub != 0
+
+	var origin, originRight *ID
+
+	if hasOrigin {
+		oc, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		ok, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		origin = &ID{Client: ClientID(oc), Clock: ok}
+	}
+
+	if hasRightOrigin {
+		rc, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		rk, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		originRight = &ID{Client: ClientID(rc), Clock: rk}
+	}
+
+	var parent *abstractType
+	var parentSub *string
+	var parentByID *ID // set when the parent is referenced by ID but not yet integrated
+
+	if !hasOrigin && !hasRightOrigin {
+		// Explicit parent info.
+		parentInfo, err := dec.ReadUint8()
+		if err != nil {
+			return nil, err
+		}
+		if parentInfo == 1 {
+			// Named root type.
+			name, err := dec.ReadVarString()
+			if err != nil {
+				return nil, err
+			}
+			parent = doc.getOrCreateType(name)
+		} else {
+			// Nested type: referenced by container item's ID.
+			pc, err := dec.ReadVarUint()
+			if err != nil {
+				return nil, err
+			}
+			pk, err := dec.ReadVarUint()
+			if err != nil {
+				return nil, err
+			}
+			parentItem := doc.store.Find(ID{Client: ClientID(pc), Clock: pk})
+			if parentItem == nil {
+				// Container not integrated yet. EncodeStateAsUpdate sorts groups
+				// ascending by client, so a lower-clientID item written into a
+				// higher-clientID peer's nested type decodes before its parent.
+				// Defer instead of hard-failing (Yjs pendingStructs parity,
+				// review finding C-3): record the parent ID and let integration
+				// resolve it once the container arrives.
+				parentByID = &ID{Client: ClientID(pc), Clock: pk}
+			} else if ct, ok := parentItem.Content.(*ContentType); ok {
+				parent = ct.Type
+			} else {
+				// Parent resolves to a tombstoned/GC'd container (its ContentType
+				// was replaced by a ContentDeleted placeholder). Treat it as a
+				// deferred/orphan reference rather than hard-failing: the item
+				// ends up with no parent and drops from the visible tree, matching
+				// Yjs's parent=nil handling. Aborting the whole update here would
+				// discard unrelated structs in the same batch.
+				parentByID = &ID{Client: ClientID(pc), Clock: pk}
+			}
+		}
+	}
+
+	// parentSub is on the wire ONLY when neither origin is present (Yjs writes
+	// it inside the `origin==null && rightOrigin==null` block). When an origin
+	// IS present the BIT6 flag may still be set, but no string follows —
+	// parentSub is inherited from the left/origin item below. Reading a string
+	// here unconditionally (on BIT6 alone) consumes content bytes and
+	// misaligns the decoder → "unknown Any tag" / EOF on V1, silent data loss
+	// on the keyed item. (#YMap-wire)
+	if hasParentSub && !hasOrigin && !hasRightOrigin {
+		sub, serr := dec.ReadVarString()
+		if serr != nil {
+			return nil, serr
+		}
+		parentSub = &sub
+	}
+
+	content, err := decodeContent(dec, doc, tag)
+	if err != nil {
+		return nil, err
+	}
+
+	item := &Item{
+		ID:          ID{Client: client, Clock: clock},
+		Origin:      origin,
+		OriginRight: originRight,
+		Parent:      parent,
+		ParentSub:   parentSub,
+		parentID:    parentByID,
+		Content:     content,
+	}
+
+	// Infer parent (and parentSub) from origin items when not set by explicit
+	// parent info. A keyed item written after the same key (LWW) carries an
+	// origin and therefore no on-wire parentSub; it inherits the key from its
+	// left/origin neighbour, exactly as Yjs resolves it during integration.
+	// Without inheriting ParentSub here the item would integrate with an empty
+	// key and never land in the parent's itemMap → silent loss. (#YMap-wire)
+	if item.Parent == nil {
+		if origin != nil {
+			if oi := doc.store.Find(*origin); oi != nil {
+				item.Parent = oi.Parent
+				if item.ParentSub == nil {
+					item.ParentSub = oi.ParentSub
+				}
+			}
+		} else if originRight != nil {
+			if ori := doc.store.Find(*originRight); ori != nil {
+				item.Parent = ori.Parent
+				if item.ParentSub == nil {
+					item.ParentSub = ori.ParentSub
+				}
+			}
+		}
+	}
+
+	// item.Parent may be nil when origin items belong to a client group not
+	// yet decoded in this update. The caller retries these after all groups.
+	return item, nil
+}
+
+func decodeContent(dec *encoding.Decoder, doc *Doc, tag byte) (Content, error) {
+	switch tag {
+	case wireDeleted:
+		n, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		return NewContentDeleted(int(n)), nil
+
+	case wireJSON:
+		n, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		if n > uint64(dec.Remaining()) {
+			return nil, ErrInvalidUpdate
+		}
+		if n == 0 || !isAnyTag(dec.RemainingBytes()[0]) {
+			vals, err := readJSONVals(dec, n)
+			if err != nil {
+				return nil, err
+			}
+			return NewContentJSON(vals...), nil
+		}
+		// ygo ≤1.51.0 wrote lib0 Any per value, always starting with a tag
+		// 116–127, as does a 116–127-byte JSON text. One encoder writes the
+		// whole item, so try JSON text for all values, else Any for all.
+		// JSON text (Yjs) wins input valid both ways.
+		rem := dec.RemainingBytes()
+		sub := encoding.NewDecoder(rem)
+		vals, jsonErr := readJSONVals(sub, n)
+		if jsonErr == nil {
+			for range len(rem) - sub.Remaining() {
+				_, _ = dec.ReadUint8()
+			}
+			return NewContentJSON(vals...), nil
+		}
+		if vals, err = readLegacyAnyVals(dec, n); err != nil {
+			return nil, jsonErr
+		}
+		return NewContentJSON(vals...), nil
+
+	case wireBinary:
+		b, err := dec.ReadVarBytes()
+		if err != nil {
+			return nil, err
+		}
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		return NewContentBinary(cp), nil
+
+	case wireString:
+		s, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		return NewContentString(s), nil
+
+	case wireEmbed:
+		// V1: embed is a JSON-text varstring (Yjs writeJSON), not a lib0 Any.
+		js, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		v, err := fmtValFromJSON(js)
+		if err != nil {
+			return nil, err
+		}
+		return NewContentEmbed(v), nil
+
+	case wireFormat:
+		key, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		js, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		val, err := fmtValFromJSON(js)
+		if err != nil {
+			return nil, err
+		}
+		return NewContentFormat(key, val), nil
+
+	case wireType:
+		typeClass, err := dec.ReadUint8()
+		if err != nil {
+			return nil, err
+		}
+		at, err := decodeTypeContent(dec, doc, typeClass)
+		if err != nil {
+			return nil, err
+		}
+		return NewContentType(at), nil
+
+	case wireAny:
+		n, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		if n > uint64(dec.Remaining()) {
+			return nil, ErrInvalidUpdate
+		}
+		vals := make([]any, n)
+		for i := range vals {
+			if vals[i], err = dec.ReadAny(); err != nil {
+				return nil, err
+			}
+		}
+		return NewContentAny(vals...), nil
+
+	case wireDoc:
+		guidBytes, err := dec.ReadVarBytes()
+		if err != nil {
+			return nil, err
+		}
+		optsAny, err := dec.ReadAny()
+		if err != nil {
+			return nil, err
+		}
+		return NewContentDoc(newSubdocFromOpts(string(guidBytes), optsAny)), nil
+
+	case wireMove:
+		clientU, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		clock, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		targetLen, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, err
+		}
+		target := &ID{Client: ClientID(clientU), Clock: clock}
+		return NewContentMove(target, int(targetLen)), nil
+
+	default:
+		return nil, fmt.Errorf("unknown content tag: %d", tag)
+	}
+}
+
+func decodeTypeContent(dec *encoding.Decoder, doc *Doc, typeClass byte) (*abstractType, error) {
+	switch typeClass {
+	case 0: // YArray
+		arr := &YArray{}
+		arr.doc = doc
+		arr.itemMap = make(map[string]*Item)
+		arr.owner = arr
+		return &arr.abstractType, nil
+
+	case 1: // YMap
+		m := &YMap{}
+		m.doc = doc
+		m.itemMap = make(map[string]*Item)
+		m.owner = m
+		return &m.abstractType, nil
+
+	case 2: // YText
+		txt := &YText{}
+		txt.doc = doc
+		txt.itemMap = make(map[string]*Item)
+		txt.owner = txt
+		return &txt.abstractType, nil
+
+	case 3: // YXmlElement
+		nodeName, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		elem := NewYXmlElement(nodeName)
+		elem.doc = doc
+		return &elem.abstractType, nil
+
+	case 4: // YXmlFragment
+		frag := &YXmlFragment{}
+		frag.doc = doc
+		frag.itemMap = make(map[string]*Item)
+		frag.owner = frag
+		return &frag.abstractType, nil
+
+	case 5: // YXmlHook — ygo has no hook type, but Yjs writes a hookName
+		// string after the ref. We MUST consume it (mirroring decodeTypeContentV2)
+		// or the rest of the update stream desyncs. Degrade to a rawType
+		// placeholder. (#wire-conformance)
+		if _, err := dec.ReadVarString(); err != nil {
+			return nil, err
+		}
+		r := &rawType{}
+		r.doc = doc
+		r.itemMap = make(map[string]*Item)
+		r.owner = r
+		return &r.abstractType, nil
+
+	case 6: // YXmlText
+		xt := NewYXmlText()
+		xt.doc = doc
+		return &xt.abstractType, nil
+
+	default:
+		// Unknown type class: placeholder rawType.
+		r := &rawType{}
+		r.doc = doc
+		r.itemMap = make(map[string]*Item)
+		r.owner = r
+		return &r.abstractType, nil
+	}
+}
+
+func decodeDeleteSet(dec *encoding.Decoder) (DeleteSet, error) {
+	ds := newOrderedDeleteSet()
+	n, err := dec.ReadVarUint()
+	if err != nil {
+		return ds, err
+	}
+	if n > maxV2Items {
+		return ds, ErrInvalidUpdate
+	}
+	for i := uint64(0); i < n; i++ {
+		clientU, err := dec.ReadVarUint()
+		if err != nil {
+			return ds, err
+		}
+		numRanges, err := dec.ReadVarUint()
+		if err != nil {
+			return ds, err
+		}
+		if numRanges > maxV2Items {
+			return ds, ErrInvalidUpdate
+		}
+		client := ClientID(clientU)
+		for j := uint64(0); j < numRanges; j++ {
+			clock, err := dec.ReadVarUint()
+			if err != nil {
+				return ds, err
+			}
+			length, err := dec.ReadVarUint()
+			if err != nil {
+				return ds, err
+			}
+			if _, seen := ds.clients[client]; !seen {
+				ds.order = append(ds.order, client) // Yjs applies a delete set in its encoded order
+			}
+			ds.clients[client] = append(ds.clients[client], DeleteRange{Clock: clock, Len: length})
+		}
+	}
+	for c := range ds.clients {
+		ds.sortAndCompact(c)
+	}
+	return ds, nil
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func clientsSorted[T any](m map[ClientID]T) []ClientID {
+	out := make([]ClientID, 0, len(m))
+	for c := range m {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func wrapUpdateErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrInvalidUpdate, err)
+}
+
+// fmtValToJSON serialises a ContentFormat/ContentEmbed/ContentJSON value as
+// JSON text, matching Yjs's JSON.stringify. HTML escaping is off because
+// JSON.stringify never escapes <, > or &.
+//
+// A non-finite number is written as null, as JSON.stringify does; any other
+// unencodable value (one that bypassed checkTextValue) panics, as WriteAny does.
+func fmtValToJSON(v any) string {
+	if v == nil {
+		return "null"
+	}
+	s, err := encodeJSONText(v)
+	if err != nil {
+		if s, err = encodeJSONText(nullNonFinite(v)); err != nil {
+			panic("crdt: value is not JSON-encodable: " + err.Error())
+		}
+	}
+	return s
+}
+
+func encodeJSONText(v any) (string, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return string(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
+}
+
+// nullNonFinite returns v with every NaN/±Inf replaced by nil.
+func nullNonFinite(v any) any {
+	switch t := v.(type) {
+	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return nil
+		}
+	case float32:
+		if f := float64(t); math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil
+		}
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = nullNonFinite(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = nullNonFinite(e)
+		}
+		return out
+	}
+	return v
+}
+
+// fmtValFromJSON parses JSON text written by fmtValToJSON or Yjs's
+// JSON.stringify, with Yjs's 'undefined' marker as nil. Numbers decode as
+// float64, booleans as bool, null as nil.
+func fmtValFromJSON(s string) (any, error) {
+	if s == "undefined" {
+		return nil, nil
+	}
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// isAnyTag reports whether b is a lib0 Any type tag.
+func isAnyTag(b byte) bool { return b >= 116 && b <= 127 }
+
+// readJSONVals reads n ContentJSON values in Yjs's JSON-text form.
+func readJSONVals(dec *encoding.Decoder, n uint64) ([]any, error) {
+	vals := make([]any, n)
+	for i := range vals {
+		js, err := dec.ReadVarString()
+		if err != nil {
+			return nil, err
+		}
+		if vals[i], err = fmtValFromJSON(js); err != nil {
+			return nil, err
+		}
+	}
+	return vals, nil
+}
+
+// readLegacyAnyVals reads n ContentJSON values in ygo ≤1.51.0's lib0 Any
+// form, with numbers widened to float64 as the JSON form decodes them.
+func readLegacyAnyVals(dec *encoding.Decoder, n uint64) ([]any, error) {
+	vals := make([]any, n)
+	for i := range vals {
+		v, err := dec.ReadAny()
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = jsonNumbers(v)
+	}
+	return vals, nil
+}
+
+// jsonNumbers widens lib0 Any's float32 and int64 to float64, recursively.
+func jsonNumbers(v any) any {
+	switch x := v.(type) {
+	case float32:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case []any:
+		for i := range x {
+			x[i] = jsonNumbers(x[i])
+		}
+	case map[string]any:
+		for k := range x {
+			x[k] = jsonNumbers(x[k])
+		}
+	}
+	return v
+}
+
+// appendTrimmed stores an item without integrating it, dropping the prefix the
+// store already has for its client. existingEnd must be at least the item's
+// clock.
+func appendTrimmed(store *StructStore, item *Item, existingEnd uint64) {
+	if offset := int(existingEnd - item.ID.Clock); offset > 0 {
+		item.ID.Clock += uint64(offset)
+		item.Content = item.Content.Splice(offset)
+	}
+	store.Append(item)
+}
+
+// tryIntegrate attempts to integrate item into the doc store. Returns
+// true on success (item is now integrated into the linked list, or
+// stored as an orphan when its parent is truly unresolvable). Returns
+// false if blocked on a future-clock dependency — the caller should
+// leave it in the pending queue.
+//
+// Used by the inline retry loop to drain pending items that may now
+// be integrable. Parallels the normal decode-loop path but with items
+// that have already been decoded.
+func tryIntegrate(txn *Transaction, item *Item) bool {
+	store := txn.doc.store
+
+	// Read bounds directly in the retry hot path; missing clients need no
+	// call to the content-length clock helper.
+	existingEnd := uint64(0)
+	if items := store.clients[item.ID.Client]; len(items) > 0 {
+		last := items[len(items)-1]
+		existingEnd = last.ID.Clock + uint64(last.Content.Len())
+	}
+
+	// A same-client clock gap is blocked regardless of content length.
+	if item.ID.Clock > existingEnd {
+		return false
+	}
+
+	// Fully covered ranges need no further integration.
+	if item.ID.Clock+uint64(item.Content.Len()) <= existingEnd {
+		return true
+	}
+
+	// GC-orphan path (no parent, deleted): store without integration, trimmed
+	// to the not-yet-integrated suffix exactly as the decode loops do.
+	//
+	// The trim matters here and not only there: this item was parked for a
+	// same-client clock gap, and by the time the retry runs the store's clock
+	// for that client can have advanced INTO (but not through) the item's
+	// range. Appending it untrimmed would leave overlapping, out-of-order
+	// structs behind, in a store whose Append and state-vector logic assume a
+	// contiguous per-client list. The guards above leave clock <= existingEnd
+	// here, so the offset is never negative.
+	if item.Parent == nil && item.Deleted {
+		appendTrimmed(store, item, existingEnd)
+		return true
+	}
+
+	// Try to resolve parent via Origin / OriginRight / ParentSub fallback.
+	// As in the first-pass decode, a keyed item that arrived with an origin
+	// has no on-wire parentSub and must inherit the key from its origin
+	// neighbour here too, or it integrates keyless and is dropped from the
+	// parent's itemMap. (#YMap-wire)
+	if item.Parent == nil {
+		if item.Origin != nil {
+			if len(store.clients[item.Origin.Client]) == 0 {
+				return false
+			}
+			if oi := store.Find(*item.Origin); oi != nil {
+				item.Parent = oi.Parent
+				if item.ParentSub == nil {
+					item.ParentSub = oi.ParentSub
+				}
+			} else if item.Origin.Clock >= store.NextClock(item.Origin.Client) {
+				return false // future clock — still blocked
+			}
+		}
+		if item.Parent == nil && item.OriginRight != nil {
+			if len(store.clients[item.OriginRight.Client]) == 0 {
+				return false
+			}
+			if ori := store.Find(*item.OriginRight); ori != nil {
+				item.Parent = ori.Parent
+				if item.ParentSub == nil {
+					item.ParentSub = ori.ParentSub
+				}
+			} else if item.OriginRight.Clock >= store.NextClock(item.OriginRight.Client) {
+				return false
+			}
+		}
+		// Parent referenced by container item-ID (review finding C-3): resolve
+		// precisely if the container has arrived; if it references a future
+		// clock, park (return false) rather than grafting onto an arbitrary map
+		// via the ParentSub fallback below.
+		if item.Parent == nil && item.parentID != nil {
+			if len(store.clients[item.parentID.Client]) == 0 {
+				return false
+			}
+			if pi := store.Find(*item.parentID); pi != nil {
+				if ct, ok := pi.Content.(*ContentType); ok {
+					item.Parent = ct.Type
+				}
+			} else if item.parentID.Clock >= store.NextClock(item.parentID.Client) {
+				return false
+			}
+		}
+		if item.Parent == nil {
+			// A keyed item still unresolved here is a genuine orphan (its
+			// container/origin was deleted and GC'd). Yjs drops it on every
+			// peer; do NOT graft it onto an arbitrary map by scanning the store,
+			// which diverges by integration order (#156). Store it as the GC
+			// struct Yjs integrates it as.
+			item.markGCOrphan()
+			appendTrimmed(store, item, existingEnd)
+			return true
+		}
+	}
+
+	// Origin present but referring to a future clock -> still blocked.
+	if item.Origin != nil {
+		items := store.clients[item.Origin.Client]
+		if len(items) == 0 {
+			return false
+		}
+		last := items[len(items)-1]
+		if item.Origin.Clock >= last.ID.Clock+uint64(last.Content.Len()) {
+			return false
+		}
+	}
+
+	// OriginRight referring to a future clock -> still blocked. Yjs's getMissing
+	// blocks integration on origin, rightOrigin, OR parent; ygo only checked
+	// OriginRight inside the Parent==nil branch above. A root type's parent is
+	// resolved by name, so that branch is skipped and an item whose right origin
+	// is a not-yet-integrated client would otherwise integrate at the wrong
+	// position (permanent divergence, review finding C-2). itemFutureDep already
+	// reports OriginRight as the missing dependency, so the item parks here and
+	// retries once that client's clock advances.
+	if item.OriginRight != nil {
+		items := store.clients[item.OriginRight.Client]
+		if len(items) == 0 {
+			return false
+		}
+		last := items[len(items)-1]
+		if item.OriginRight.Clock >= last.ID.Clock+uint64(last.Content.Len()) {
+			return false
+		}
+	}
+
+	// Resolve left neighbor for integrate().
+	if item.Origin != nil {
+		item.Left = store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
+	}
+
+	// A parked range may now overlap the store; integrate only its new suffix.
+	item.integrate(txn, int(existingEnd-item.ID.Clock))
+	return true
+}
+
+// itemFutureDep reports whether item is blocked on a future-clock dependency
+// (one whose referenced clock has not yet been integrated into the store).
+// Returns (missingClient, storeClockAtParkTime, true) if yes; otherwise
+// (0, 0, false) indicating the item's parent is truly unresolvable (e.g.
+// origin references a GC placeholder whose parent info was lost).
+func itemFutureDep(item *Item, store *StructStore) (ClientID, uint64, bool) {
+	if item.Origin != nil {
+		storeClock := store.NextClock(item.Origin.Client)
+		if item.Origin.Clock >= storeClock {
+			return item.Origin.Client, storeClock, true
+		}
+	}
+	if item.OriginRight != nil {
+		storeClock := store.NextClock(item.OriginRight.Client)
+		if item.OriginRight.Clock >= storeClock {
+			return item.OriginRight.Client, storeClock, true
+		}
+	}
+	// Parent referenced by an as-yet-unintegrated container item (review
+	// finding C-3): park on the container's client until it arrives.
+	if item.Parent == nil && item.parentID != nil {
+		storeClock := store.NextClock(item.parentID.Client)
+		if item.parentID.Clock >= storeClock {
+			return item.parentID.Client, storeClock, true
+		}
+	}
+	return 0, 0, false
+}

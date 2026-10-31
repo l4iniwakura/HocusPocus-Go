@@ -1,0 +1,12 @@
+HocusPocus Go is an independent Go port of the server-side behavior of
+Hocuspocus v4.7.1, https://github.com/ueberdosis/hocuspocus.
+Original Hocuspocus: Copyright (c) 2023, Tiptap GmbH, MIT license (LICENSE).
+
+The CRDT engine in crdt/, encoding/, internal/anycodec and testutil/ is derived from reearth/ygo v1.54.0,
+commit 64fa0b47c025c71fe5478957c85ce3eff8254b56.
+Copyright (c) 2026 Re:Earth contributors, MIT (third_party/licenses/ygo.txt).
+Local changes are listed in crdt/UPSTREAM.json.
+
+The ProseMirror XML/JSON representation follows y-prosemirror's interoperability
+format. y-prosemirror: Copyright (c) 2019 Kevin Jahns
+<kevin.jahns@protonmail.com>, MIT (third_party/licenses/y-prosemirror.txt).

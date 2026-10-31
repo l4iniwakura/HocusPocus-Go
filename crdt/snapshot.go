@@ -1,0 +1,490 @@
+package crdt
+
+import (
+	"errors"
+	"sort"
+
+	"github.com/l4iniwakura/HocusPocus-Go/encoding"
+)
+
+// ErrSnapshotSourceGCed is returned by CreateDocFromSnapshot / RestoreDocument
+// when the source doc has garbage collection enabled. A GC-enabled doc replaces
+// the content of deleted items with length-only tombstones at transaction
+// commit (#78 H1), so an item deleted AFTER the snapshot no longer carries the
+// content it had at snapshot time — reconstruction would silently produce a
+// wrong (incomplete) document. Create the source with WithGC(false) to preserve
+// the history a snapshot needs.
+var ErrSnapshotSourceGCed = errors.New("crdt: cannot reconstruct from a GC-enabled source doc; create it with WithGC(false)")
+
+// Snapshot captures the state of a Yjs document at a specific moment in time.
+// It records which items existed (StateVector) and which were deleted (DeleteSet)
+// at that moment. Snapshots can be used to restore documents to a past state or
+// to compute what has changed between two points in time.
+type Snapshot struct {
+	StateVector StateVector
+	DeleteSet   DeleteSet
+}
+
+// CaptureSnapshot takes a snapshot of doc's current state.
+func CaptureSnapshot(doc *Doc) *Snapshot {
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+	return &Snapshot{
+		StateVector: doc.store.StateVector(),
+		DeleteSet:   buildDeleteSet(doc.store),
+	}
+}
+
+// EncodeSnapshot serialises snap to bytes in the Yjs V1 snapshot format,
+// interoperable with Y.encodeSnapshot / Y.decodeSnapshot.
+//
+// Wire layout (matching Yjs encodeSnapshotV2 with a V1 encoder): the delete set
+// FIRST, then the state vector, concatenated into a single stream with NO outer
+// length prefixes — `writeDeleteSet(enc, ds); writeStateVector(enc, sv)`. The
+// previous ygo layout wrote the state vector first, each block wrapped in its own
+// VarBytes length prefix, which no Yjs peer could parse (review finding F-5).
+func EncodeSnapshot(snap *Snapshot) []byte {
+	enc := encoding.NewEncoder()
+	encodeDeleteSet(enc, snap.DeleteSet)
+	encodeSnapshotStateVector(enc, snap.StateVector)
+	return enc.Bytes()
+}
+
+// encodeSnapshotStateVector writes the state vector inline (no length prefix),
+// matching Yjs writeStateVector: count, then (client, clock) pairs.
+func encodeSnapshotStateVector(enc *encoding.Encoder, sv StateVector) {
+	clients := clientsSorted(sv)
+	enc.WriteVarUint(uint64(len(clients)))
+	for _, c := range clients {
+		enc.WriteVarUint(uint64(c))
+		enc.WriteVarUint(sv[c])
+	}
+}
+
+// DecodeSnapshot parses bytes produced by EncodeSnapshot (or Y.encodeSnapshot):
+// delete set first, then the state vector, both inline (no length prefixes).
+func DecodeSnapshot(data []byte) (*Snapshot, error) {
+	dec := encoding.NewDecoder(data)
+
+	ds, err := decodeDeleteSet(dec)
+	if err != nil {
+		return nil, wrapUpdateErr(err)
+	}
+	ds.order = nil // a snapshot's delete set is only queried, so it matches one built from the store
+
+	n, err := dec.ReadVarUint()
+	if err != nil {
+		return nil, wrapUpdateErr(err)
+	}
+	// Each entry requires at least 2 bytes (client varuint + clock varuint).
+	// Guard against a crafted count that would force a huge map allocation
+	// before the (then-failing) reads — same protection as DecodeStateVectorV1.
+	if n > uint64(dec.Remaining()/2) || n > maxV2Items {
+		return nil, wrapUpdateErr(ErrInvalidUpdate)
+	}
+	sv := make(StateVector, n)
+	for i := uint64(0); i < n; i++ {
+		client, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, wrapUpdateErr(err)
+		}
+		clock, err := dec.ReadVarUint()
+		if err != nil {
+			return nil, wrapUpdateErr(err)
+		}
+		sv[ClientID(client)] = clock
+	}
+
+	return &Snapshot{StateVector: sv, DeleteSet: ds}, nil
+}
+
+// EqualSnapshots reports whether a and b represent exactly the same state.
+func EqualSnapshots(a, b *Snapshot) bool {
+	if len(a.StateVector) != len(b.StateVector) {
+		return false
+	}
+	for client, clock := range a.StateVector {
+		if b.StateVector[client] != clock {
+			return false
+		}
+	}
+	if len(a.DeleteSet.clients) != len(b.DeleteSet.clients) {
+		return false
+	}
+	for client, aRanges := range a.DeleteSet.clients {
+		bRanges := b.DeleteSet.clients[client]
+		if len(aRanges) != len(bRanges) {
+			return false
+		}
+		for i, r := range aRanges {
+			if r != bRanges[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// SnapshotContainsUpdateV1 reports whether snap already holds everything the
+// V1 update carries: every struct in update lies below snap's state vector,
+// and every deletion in it is in snap's delete set, so applying update to the
+// document snap was taken from would change nothing. update is decoded
+// without being integrated; one that does not decode returns an error
+// wrapping ErrInvalidUpdate. Matches Yjs snapshotContainsUpdate.
+func SnapshotContainsUpdateV1(snap *Snapshot, update []byte) (bool, error) {
+	structs, ds, err := decodeStructsV1(New(), update)
+	if err != nil {
+		return false, err
+	}
+	for client, items := range structs {
+		held := snap.StateVector.Clock(client)
+		for _, item := range items {
+			if item.ID.Clock+uint64(item.Content.Len()) > held {
+				return false, nil
+			}
+		}
+	}
+	for client, ranges := range ds.clients {
+		for _, r := range ranges {
+			if !deleteSetCovers(snap.DeleteSet, client, r) {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// DocContainsUpdateV1 reports whether doc already holds everything the V1
+// update carries, as SnapshotContainsUpdateV1(CaptureSnapshot(doc), update)
+// does, without building a snapshot: update is decoded before doc is locked,
+// doc is held under its read lock only, its structs are compared against
+// doc's clocks, and its deletion ranges are checked against doc's store in
+// one forward pass per client. update is not integrated; one that does not
+// decode returns an error wrapping ErrInvalidUpdate.
+func DocContainsUpdateV1(doc *Doc, update []byte) (bool, error) {
+	structs, ds, err := decodeStructsV1(New(), update)
+	if err != nil {
+		return false, err
+	}
+	doc.mu.RLock()
+	defer doc.mu.RUnlock()
+	for client, items := range structs {
+		held := doc.store.NextClock(client)
+		for _, item := range items {
+			if item.ID.Clock+uint64(item.Content.Len()) > held {
+				return false, nil
+			}
+		}
+	}
+	for client, ranges := range ds.clients {
+		if !storeDeletes(doc.store.clients[client], ranges) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// storeDeletes reports whether every clock in ranges is held by a deleted
+// struct in items, the condition buildDeleteSet records. ranges must be sorted
+// by clock, as a decoded delete set's are. The cursor into items only moves
+// forward, by a galloping search from where the previous range ended, so the
+// cost grows with the log of each gap between ranges rather than with the
+// log of the store, and a delete set covering the whole store costs one pass.
+func storeDeletes(items []*Item, ranges []DeleteRange) bool {
+	i := 0
+	for _, r := range ranges {
+		if r.Len == 0 {
+			continue
+		}
+		clock, end := r.Clock, r.Clock+r.Len
+		i = seekItem(items, i, clock)
+		for {
+			if i < 0 || i >= len(items) || !items[i].Deleted || !itemHolds(items[i], clock) {
+				return false
+			}
+			clock = items[i].ID.Clock + uint64(items[i].Content.Len())
+			if clock >= end {
+				break
+			}
+			i++
+		}
+	}
+	return true
+}
+
+// seekItem returns the index of the last struct in items, at from or after it,
+// that starts at or before clock, or from-1 when none does. It gallops forward
+// from from and then binary-searches the last step.
+func seekItem(items []*Item, from int, clock uint64) int {
+	lo, step := from, 1
+	for lo+step < len(items) && items[lo+step].ID.Clock <= clock {
+		lo += step
+		step *= 2
+	}
+	hi := min(lo+step, len(items))
+	window := items[lo:hi]
+	return lo + sort.Search(len(window), func(k int) bool { return window[k].ID.Clock > clock }) - 1
+}
+
+// itemHolds reports whether clock lies within item's clock range.
+func itemHolds(item *Item, clock uint64) bool {
+	return item.ID.Clock <= clock && clock < item.ID.Clock+uint64(item.Content.Len())
+}
+
+// deleteSetCovers reports whether ds marks every clock in r deleted for
+// client. It relies on ds being sorted and compacted (sortAndCompact), as every
+// DeleteSet buildDeleteSet or decodeDeleteSet returns is, so a covered range
+// lies inside a single one of ds's ranges.
+func deleteSetCovers(ds DeleteSet, client ClientID, r DeleteRange) bool {
+	if r.Len == 0 {
+		return true
+	}
+	ranges := ds.clients[client]
+	i := sort.Search(len(ranges), func(i int) bool { return ranges[i].Clock+ranges[i].Len > r.Clock })
+	return i < len(ranges) && ranges[i].Clock <= r.Clock && r.Clock+r.Len <= ranges[i].Clock+ranges[i].Len
+}
+
+// CreateDocFromSnapshot reconstructs the document state captured by snap into a
+// new, independent Doc — the Go equivalent of Yjs JS's createDocFromSnapshot.
+// Items inserted after the snapshot are excluded, and only deletions present in
+// the snapshot's DeleteSet are applied; a key/element deleted after the snapshot
+// reappears in the reconstruction.
+//
+// src must have been created WithGC(false) (the snapshot-history pattern):
+// a GC-enabled source may have discarded the content/tombstones the snapshot
+// references, so reconstruction returns ErrSnapshotSourceGCed rather than a
+// silently-wrong doc. The returned doc is itself non-GC, so it can be
+// snapshotted or restored from again.
+//
+// Do not call from inside a Transact callback: it acquires src's lock and would
+// deadlock — resolve the snapshot outside the transaction.
+func CreateDocFromSnapshot(src *Doc, snap *Snapshot) (*Doc, error) {
+	src.mu.Lock()
+	if src.gc {
+		src.mu.Unlock()
+		return nil, ErrSnapshotSourceGCed
+	}
+	update := encodeFromSnapshotLocked(src, snap)
+	src.mu.Unlock()
+
+	newDoc := New(WithGC(false))
+	if err := ApplyUpdateV1(newDoc, update, nil); err != nil {
+		return nil, err
+	}
+	return newDoc, nil
+}
+
+// RestoreDocument creates a new Doc that reflects doc's state at the time snap
+// was taken. Items inserted after the snapshot are excluded, and only deletions
+// present in the snapshot's DeleteSet are applied.
+//
+// Retained for backward compatibility; it delegates to CreateDocFromSnapshot
+// (the Yjs-parity name) and shares its GC-safety guard — see
+// ErrSnapshotSourceGCed.
+func RestoreDocument(doc *Doc, snap *Snapshot) (*Doc, error) {
+	return CreateDocFromSnapshot(doc, snap)
+}
+
+// EncodeStateFromSnapshot returns a V1 update representing doc's state at snap
+// time. Apply it to a fresh Doc to reconstruct the historical version.
+//
+// Like CreateDocFromSnapshot, doc must have been created WithGC(false): a
+// GC-enabled source may have discarded content the snapshot references, so this
+// returns ErrSnapshotSourceGCed rather than a silently-incomplete export. Do not
+// call it from inside a Transact callback — it takes the doc lock and would
+// deadlock.
+func EncodeStateFromSnapshot(doc *Doc, snap *Snapshot) ([]byte, error) {
+	doc.mu.Lock()
+	if doc.gc {
+		doc.mu.Unlock()
+		return nil, ErrSnapshotSourceGCed
+	}
+	update := encodeFromSnapshotLocked(doc, snap)
+	doc.mu.Unlock()
+	return update, nil
+}
+
+// encodeFromSnapshotLocked builds a V1 update containing only items within
+// snap.StateVector, encoded with snap.DeleteSet as the delete set.
+// This correctly omits post-snapshot insertions and post-snapshot deletions.
+// Must be called with doc.mu held.
+func encodeFromSnapshotLocked(doc *Doc, snap *Snapshot) []byte {
+	enc := encoding.NewEncoder()
+
+	type clientGroup struct {
+		client ClientID
+		items  []*Item
+	}
+
+	var groups []clientGroup
+	for client, items := range doc.store.clients {
+		snapClock := snap.StateVector.Clock(client)
+		var relevant []*Item
+		for _, item := range items {
+			// Include items whose starting clock falls within the snapshot window.
+			// StateVector clocks are always at item boundaries, so no partial overlap.
+			if item.ID.Clock < snapClock {
+				relevant = append(relevant, item)
+			}
+		}
+		if len(relevant) > 0 {
+			groups = append(groups, clientGroup{client, relevant})
+		}
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].client < groups[j].client })
+
+	enc.WriteVarUint(uint64(len(groups)))
+	for _, g := range groups {
+		enc.WriteVarUint(uint64(len(g.items)))
+		enc.WriteVarUint(uint64(g.client))
+		enc.WriteVarUint(0) // startClock = 0 (encoding from the beginning)
+		for _, item := range g.items {
+			encodeItem(enc, item, 0, doc.store)
+		}
+	}
+
+	// Use the snapshot's delete set, not the current document delete set.
+	// This preserves items that were deleted after the snapshot was taken.
+	encodeDeleteSet(enc, snap.DeleteSet)
+	return enc.Bytes()
+}
+
+// gcTxnDeleteSet is the per-transaction counterpart to RunGC (#78 H1, v1.15.0).
+// Called from transactInternal under the doc lock, after buildPhase2 has
+// captured observer deltas. For every item tombstoned in this transaction,
+// replaces its Content with a length-only ContentDeleted placeholder so
+// long-running documents don't retain full content for items that will
+// never be observable again.
+//
+// Caller must hold d.mu. Unlike RunGC this does NOT acquire the lock or
+// run the adjacent-tombstone merge pass — those are for the manual
+// whole-document RunGC entry point.
+func gcTxnDeleteSet(doc *Doc, txn *Transaction) {
+	for client, ranges := range txn.deleteSet.clients {
+		items := doc.store.clients[client]
+		if len(items) == 0 {
+			continue
+		}
+		for _, r := range ranges {
+			rangeEnd := r.Clock + r.Len
+			// Start at the item containing the range boundary. Searching by
+			// start clock avoids rescanning a growing prefix for every deletion.
+			start := sort.Search(len(items), func(i int) bool { return items[i].ID.Clock > r.Clock }) - 1
+			if start < 0 {
+				start = 0
+			}
+			for _, item := range items[start:] {
+				if item.ID.Clock >= rangeEnd {
+					break
+				}
+				if item.ID.Clock+uint64(item.Content.Len()) <= r.Clock {
+					continue
+				}
+				if !item.Deleted {
+					continue // shouldn't happen for items in deleteSet, but defensive
+				}
+				if _, alreadyGC := item.Content.(*ContentDeleted); alreadyGC {
+					continue
+				}
+				if doc.gcFilter == nil || doc.gcFilter(item) {
+					item.Content = NewContentDeleted(item.Content.Len())
+				}
+			}
+		}
+	}
+}
+
+// RunGC replaces the content of deleted items with lightweight ContentDeleted
+// tombstones, freeing memory while preserving the structural position information
+// required for CRDT correctness. It then merges adjacent ContentDeleted items
+// from the same client into single nodes, compacting the linked list.
+//
+// This is a no-op when doc.gc is false. After RunGC runs, RestoreDocument can
+// no longer reconstruct states that predate the GC'd deletions — take snapshots
+// before calling RunGC if you need to preserve history.
+func RunGC(doc *Doc) {
+	if !doc.gc {
+		return
+	}
+	doc.mu.Lock()
+	defer doc.mu.Unlock()
+
+	for client, items := range doc.store.clients {
+		// Pass 1: replace deleted item content with ContentDeleted tombstones.
+		for _, item := range items {
+			if item.Deleted {
+				if _, alreadyGC := item.Content.(*ContentDeleted); !alreadyGC {
+					if doc.gcFilter == nil || doc.gcFilter(item) {
+						item.Content = NewContentDeleted(item.Content.Len())
+					}
+				}
+			}
+		}
+
+		// Pass 2: merge adjacent ContentDeleted items that are consecutive in
+		// both the store slice and the linked list. Merging them reduces the
+		// number of nodes future origin lookups must traverse.
+		kept := make([]*Item, 0, len(items))
+		for _, item := range items {
+			prevCD, prevIsCDItem := func() (*ContentDeleted, bool) {
+				if len(kept) == 0 {
+					return nil, false
+				}
+				p := kept[len(kept)-1]
+				cd, ok := p.Content.(*ContentDeleted)
+				return cd, ok
+			}()
+			itemCD, itemIsCD := item.Content.(*ContentDeleted)
+
+			// Merge only when both are tombstones, directly adjacent in the
+			// linked list (no gap, no interleaving items), clocks are
+			// contiguous (prev.Clock+prev.Len == item.Clock), and the merged
+			// tombstone still encodes item's position: item's Origin is prev's
+			// last clock and both share an OriginRight (Yjs Item.mergeWith).
+			// A live item whose origin is inside item moves on decode otherwise.
+			prev := func() *Item {
+				if len(kept) == 0 {
+					return nil
+				}
+				return kept[len(kept)-1]
+			}()
+			if prevIsCDItem && itemIsCD &&
+				gcMergeable(prev, item) &&
+				prev.Right == item && item.Left == prev &&
+				prev.ID.Clock+uint64(prev.Content.Len()) == item.ID.Clock &&
+				item.Origin != nil && item.Origin.Client == client && item.Origin.Clock == item.ID.Clock-1 &&
+				originIDEquals(prev.OriginRight, item.OriginRight) {
+				// Absorb item into prev: extend the tombstone length, rewire
+				// the linked list, and drop item from the store slice.
+				prevCD.length += itemCD.length
+				prev.Right = item.Right
+				if item.Right != nil {
+					item.Right.Left = prev
+				}
+				// A marker on item would walk from an off-list node.
+				if prev.Parent != nil {
+					prev.Parent.clearMarkers()
+				}
+				// item is discarded from kept — it no longer exists as a
+				// separate node.
+				continue
+			}
+			kept = append(kept, item)
+		}
+		doc.store.clients[client] = kept
+	}
+}
+
+// gcMergeable reports whether RunGC may absorb tombstone item into prev beyond
+// adjacency and clock contiguity (Yjs Item.mergeWith). A key's itemMap entry
+// is never absorbed, so it stays the on-list node Set links after.
+func gcMergeable(prev, item *Item) bool {
+	if prev.Parent != item.Parent || !parentSubEqual(prev.ParentSub, item.ParentSub) ||
+		prev.MovedBy != item.MovedBy || prev.redone != nil || item.redone != nil {
+		return false
+	}
+	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {
+		return false
+	}
+	return true
+}
