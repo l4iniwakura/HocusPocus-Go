@@ -61,3 +61,18 @@ func (d *Doc) RootHasSequence(name string) bool {
 	root := d.share[name]
 	return root != nil && root.baseType().start != nil
 }
+
+// HasMapAttributes reports live attributes on a Y.Text/Y.XmlText object. These
+// are distinct from inline formatting and are not represented in ProseMirror JSON.
+func (t *YText) HasMapAttributes() bool {
+	if t.doc != nil {
+		t.doc.mu.RLock()
+		defer t.doc.mu.RUnlock()
+	}
+	for _, item := range t.itemMap {
+		if !item.Deleted {
+			return true
+		}
+	}
+	return false
+}

@@ -3,9 +3,22 @@ package hocuspocus
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"github.com/l4iniwakura/HocusPocus-Go/crdt"
 	"testing"
 )
+
+func TestTextAttributeInspectionFromOriginalYjs(t *testing.T) {
+	raw, _ := base64.StdEncoding.DecodeString("AQT5hennBQAHAQtwcm9zZW1pcnJvcgMJcGFyYWdyYXBoBwD5hennBQAGBAD5hennBQEHdmlzaWJsZSgA+YXp5wUBB29uY2xpY2sBdwZoaWRkZW4A")
+	d := crdt.New()
+	if err := crdt.ApplyUpdateV1(d, raw, nil); err != nil {
+		t.Fatal(err)
+	}
+	text := d.GetXmlFragment("prosemirror").Children()[0].(*crdt.YXmlElement).Children()[0].(*crdt.YXmlText)
+	if text.ToString() != "visible" || !text.HasMapAttributes() {
+		t.Fatal("wire attributes lost")
+	}
+}
 
 func TestPublicMessageReceiverAppliesAndReplies(t *testing.T) {
 	s, _ := testServer(t, nil)
