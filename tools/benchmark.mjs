@@ -25,18 +25,23 @@ async function scenario(runtime, documents) {
   const url = await new Promise((accept,reject) => { const timer = setTimeout(() => reject(new Error('startup timeout')), 15000); child.once('error', reject); child.stdout.on('data', bytes => { const found = /LISTEN (\S+)/.exec(String(bytes)); if (found) { clearTimeout(timer); accept(`ws://${found[1]}`); } }); });
   const idleMiB = rss(child.pid) / 1048576;
   let acknowledgements = 0; let allAcknowledged, rejectCompletion;
+  const pumps = [];
   const completed = new Promise((resolve,reject) => { allAcknowledged = resolve; rejectCompletion = reject; });
   await Promise.all(Array.from({ length: documents }, (_, index) => new Promise((accept,reject) => {
    const name = `benchmark-${index}`; const socket = new WebSocket(url); sockets.push(socket);
+   let sent = 0, outstanding = 0, active = false;
+   const pump = () => { if (!active) return; while (sent < updates.length && outstanding < 16) { const update = updates[sent++]; outstanding++; socket.send(encoder(name, 0, e => { encoding.writeVarUint(e, 2); encoding.writeVarUint8Array(e, update); })); } };
+   pumps.push(() => { active = true; pump(); });
    socket.once('error', reject);
    socket.on('open', () => socket.send(encoder(name, 2, e => { encoding.writeVarUint(e, 0); encoding.writeVarString(e, ''); })));
    socket.on('message', bytes => { const d = decoding.createDecoder(new Uint8Array(bytes)); decoding.readVarString(d); const kind = decoding.readVarUint(d);
     if (kind === 2 && decoding.readVarUint(d) === 2) accept();
-    if (kind === 8) { if (decoding.readVarUint(d) !== 1) return rejectCompletion(new Error('update rejected')); acknowledgements++; if (acknowledgements === documents * updates.length) allAcknowledged(); }
+    if (kind === 7) return rejectCompletion(new Error('server closed a benchmark document'));
+    if (kind === 8) { if (decoding.readVarUint(d) !== 1) return rejectCompletion(new Error('update rejected')); outstanding--; acknowledgements++; pump(); if (acknowledgements === documents * updates.length) allAcknowledged(); }
    });
   })));
   const start = performance.now();
-  for (let index = 0; index < documents; index++) for (const update of updates) sockets[index].send(encoder(`benchmark-${index}`, 0, e => { encoding.writeVarUint(e, 2); encoding.writeVarUint8Array(e, update); }));
+  for (const pump of pumps) pump();
   const timer = setTimeout(() => rejectCompletion(new Error('ACK timeout')), 30000);
   await completed; clearTimeout(timer);
   const elapsedMs = performance.now() - start; const activeMiB = rss(child.pid) / 1048576;
