@@ -59,7 +59,15 @@ func (d *Doc) RootHasSequence(name string) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	root := d.share[name]
-	return root != nil && root.baseType().start != nil
+	if root == nil {
+		return false
+	}
+	for item := root.baseType().start; item != nil; item = item.Right {
+		if item.ParentSub == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // HasMapAttributes reports live attributes on a Y.Text/Y.XmlText object. These

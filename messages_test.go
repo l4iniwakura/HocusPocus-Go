@@ -75,4 +75,13 @@ func TestRootInspectionPreservesSequence(t *testing.T) {
 	if copy.RootHasSequence("absent") {
 		t.Fatal("absent root has sequence")
 	}
+	mapDoc := crdt.New()
+	mapDoc.Transact(func(tx *crdt.Transaction) { tx.GetMap("metadata").Set(tx, "key", "value") })
+	decodedMap := crdt.New()
+	if err := crdt.ApplyUpdateV1(decodedMap, mapDoc.EncodeStateAsUpdate(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if decodedMap.RootHasSequence("metadata") {
+		t.Fatal("map entries were mistaken for sequence content")
+	}
 }
